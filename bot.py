@@ -56,20 +56,11 @@ MANAGER_CHAT_ID = int(MANAGER_CHAT_ID_RAW) if MANAGER_CHAT_ID_RAW.isdigit() else
 
 # Claude model nomini to'g'irlash (xato aliaslarni to'g'ri modelga o'tkazish)
 def resolve_model_name(raw_model: str) -> str:
-    cleaned = (raw_model or "").strip().lower()
-    mapping = {
-        "claude-sonnet-5-5": "claude-3-5-sonnet-latest",
-        "claude-haiku-5-5": "claude-3-5-haiku-latest",
-        "claude-sonnet-3-5": "claude-3-5-sonnet-latest",
-        "claude-3-5-sonnet": "claude-3-5-sonnet-latest",
-        "claude-3-7-sonnet": "claude-3-7-sonnet-latest",
-        "claude-3-haiku": "claude-3-haiku-20240307",
-        "claude-haiku": "claude-3-5-haiku-latest",
-    }
-    return mapping.get(cleaned, cleaned or "claude-3-5-sonnet-latest")
+    cleaned = (raw_model or "").strip()
+    return cleaned or "claude-haiku-5-5"
 
 
-MODEL = resolve_model_name(os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest"))
+MODEL = resolve_model_name(os.getenv("CLAUDE_MODEL", "claude-haiku-5-5"))
 
 BASE_DIR = Path(__file__).parent
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
@@ -1981,7 +1972,20 @@ def main() -> None:
     # 24/7 bepul serverlar uchun foniy serverni yurgizish
     start_health_server()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
+        .get_updates_write_timeout(30)
+        .get_updates_pool_timeout(30)
+        .build()
+    )
 
     # Buyruqlar
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2019,7 +2023,7 @@ def main() -> None:
     app.add_handler(MessageHandler(private & (filters.VOICE | filters.AUDIO), handle_voice))
 
     log.info("Dekor Panel Telegram boti muvaffaqiyatli ishga tushmoqda...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
