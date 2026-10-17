@@ -9,6 +9,8 @@ import os
 import random
 import re
 import threading
+import time
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -28,8 +30,10 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
+import httpx
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -1936,11 +1940,293 @@ async def post_init(application: Application) -> None:
         log.warning("Buyruqlarni o'rnatishda xatolik: %s", e)
 
 
+
+# ---------------------------------------------------------------------------
+# Instagram'ga post / reels / karusel chiqarish (faqat admin / menejer uchun)
+# ---------------------------------------------------------------------------
+IG_TOKEN = os.getenv("INSTAGRAM_TOKEN", "").strip()
+IG_ACCOUNT_ID = os.getenv("INSTAGRAM_ACCOUNT_ID", "").strip()
+IG_API_VERSION = os.getenv("IG_API_VERSION", "v23.0").strip()
+IG_GRAPH = f"https://graph.instagram.com/{IG_API_VERSION}"
+IG_MEDIA_DIR = Path(os.getenv("IG_MEDIA_DIR", "/tmp/ig_media"))
+IG_MAX_ITEMS = 10
+
+
+def ig_public_base() -> str:
+    base = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or ""
+    return base.strip().rstrip("/")
+
+
+def ig_cleanup_old_files(max_age_sec: int = 3600) -> None:
+    try:
+        IG_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        for f in IG_MEDIA_DIR.iterdir():
+            if f.is_file() and now - f.stat().st_mtime > max_age_sec:
+                f.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning("IG fayllarni tozalashda xatolik: %s", e)
+
+
+def ig_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.user_data.setdefault("ig", {"active": False, "items": [], "caption": ""})
+
+
+def ig_reset(context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = context.user_data.get("ig")
+    if st:
+        for it in st.get("items", []):
+            (IG_MEDIA_DIR / it["name"]).unlink(missing_ok=True)
+    context.user_data["ig"] = {"active": False, "items": [], "caption": ""}
+
+
+IG_KEYBOARD = InlineKeyboardMarkup(
+    [[
+        InlineKeyboardButton("📤 Опубликовать", callback_data="ig_publish"),
+        InlineKeyboardButton("❌ Отмена", callback_data="ig_cancel"),
+    ]]
+)
+
+
+async def cmd_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not update.message or not is_admin(user.id if user else None):
+        return
+    if not (IG_TOKEN and IG_ACCOUNT_ID):
+        await update.message.reply_text(
+            "Instagram не подключён: в Render (Environment) нет INSTAGRAM_TOKEN или INSTAGRAM_ACCOUNT_ID."
+        )
+        return
+    if not ig_public_base():
+        await update.message.reply_text(
+            "Не задан публичный адрес сервиса. Добавьте в Render (Environment) переменную PUBLIC_URL, "
+            "например https://telegrambot-1oo0.onrender.com"
+        )
+        return
+    ig_reset(context)
+    st = ig_state(context)
+    st["active"] = True
+    await update.message.reply_text(
+        "Режим публикации в Instagram включён.\n\n"
+        "1) Пришлите фото (до 10 штук = карусель) или одно видео (будет Reels).\n"
+        "2) Подпись можно написать в подписи к фото или отдельным сообщением.\n"
+        "3) Нажмите «Опубликовать».\n\n"
+        "Отмена: /cancel_post"
+    )
+
+
+async def cmd_cancel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not update.message or not is_admin(user.id if user else None):
+        return
+    ig_reset(context)
+    await update.message.reply_text("Публикация отменена.")
+
+
+async def cmd_ig_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not update.message or not is_admin(user.id if user else None):
+        return
+    if not (IG_TOKEN and IG_ACCOUNT_ID):
+        await update.message.reply_text("INSTAGRAM_TOKEN или INSTAGRAM_ACCOUNT_ID не заданы в Render.")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{IG_GRAPH}/{IG_ACCOUNT_ID}",
+                params={"fields": "username", "access_token": IG_TOKEN},
+            )
+        data = r.json()
+        if r.status_code == 200 and data.get("username"):
+            await update.message.reply_text(f"✅ Instagram подключён: @{data['username']}")
+        else:
+            msg = (data.get("error") or {}).get("message", str(data))[:300]
+            await update.message.reply_text(f"❌ Instagram ответил ошибкой: {msg}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Не удалось связаться с Instagram: {e}")
+
+
+async def ig_handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin 'post' rejimida yuborilgan foto/videoni yig'ish."""
+    user = update.effective_user
+    msg = update.message
+    if not msg or not is_admin(user.id if user else None):
+        return
+    st = ig_state(context)
+    if not st["active"]:
+        return  # oddiy handle_message ishlaydi
+
+    kind = "video" if msg.video else "photo"
+    if kind == "video" and st["items"]:
+        await msg.reply_text("Видео (Reels) публикуется отдельно. Отмените /cancel_post и начните заново.")
+        raise ApplicationHandlerStop
+    if st["items"] and st["items"][0]["kind"] == "video":
+        await msg.reply_text("Уже добавлено видео. Для фото начните заново: /cancel_post, затем /post.")
+        raise ApplicationHandlerStop
+    if len(st["items"]) >= IG_MAX_ITEMS:
+        await msg.reply_text("Максимум 10 фото в одном посте.")
+        raise ApplicationHandlerStop
+
+    try:
+        IG_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        ig_cleanup_old_files()
+        tg_file = await (msg.video.get_file() if kind == "video" else msg.photo[-1].get_file())
+        name = f"{uuid.uuid4().hex}.{'mp4' if kind == 'video' else 'jpg'}"
+        await tg_file.download_to_drive(custom_path=IG_MEDIA_DIR / name)
+    except Exception as e:
+        log.warning("IG media yuklab olishda xatolik: %s", e)
+        await msg.reply_text(
+            "Не удалось получить файл от Telegram (видео больше 20 МБ бот скачать не может). Попробуйте файл меньше."
+        )
+        raise ApplicationHandlerStop
+
+    first = not st["items"]
+    st["items"].append({"kind": kind, "name": name})
+    if msg.caption and not st["caption"]:
+        st["caption"] = msg.caption.strip()
+
+    group_id = msg.media_group_id
+    already = st.get("last_group") == group_id and group_id is not None
+    st["last_group"] = group_id
+    if first or not already:
+        await msg.reply_text(
+            "Файл добавлен. Можно прислать ещё фото или написать подпись.\nКогда всё готово — нажмите «Опубликовать».",
+            reply_markup=IG_KEYBOARD,
+        )
+    raise ApplicationHandlerStop
+
+
+async def ig_handle_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.message
+    if not msg or not is_admin(user.id if user else None):
+        return
+    st = ig_state(context)
+    if not st["active"]:
+        return
+    st["caption"] = (msg.text or "").strip()[:2200]
+    await msg.reply_text("Подпись сохранена ✅", reply_markup=IG_KEYBOARD)
+    raise ApplicationHandlerStop
+
+
+async def ig_graph_post(client: httpx.AsyncClient, path: str, data: dict) -> dict:
+    payload = dict(data)
+    payload["access_token"] = IG_TOKEN
+    r = await client.post(f"{IG_GRAPH}/{path}", data=payload)
+    js = r.json()
+    if r.status_code >= 400 or "error" in js:
+        err = (js.get("error") or {})
+        raise RuntimeError(err.get("error_user_msg") or err.get("message") or str(js))
+    return js
+
+
+async def ig_wait_ready(client: httpx.AsyncClient, container_id: str, max_wait: int) -> None:
+    waited = 0
+    while waited <= max_wait:
+        r = await client.get(
+            f"{IG_GRAPH}/{container_id}",
+            params={"fields": "status_code,status", "access_token": IG_TOKEN},
+        )
+        js = r.json()
+        status = js.get("status_code")
+        if status == "FINISHED":
+            return
+        if status in ("ERROR", "EXPIRED"):
+            raise RuntimeError(f"Instagram не принял файл: {js.get('status') or status}")
+        await asyncio.sleep(5)
+        waited += 5
+    raise RuntimeError("Instagram слишком долго обрабатывает файл. Попробуйте ещё раз позже.")
+
+
+async def ig_publish_items(items: list, caption: str) -> str:
+    base = ig_public_base()
+    urls = [f"{base}/media/{it['name']}" for it in items]
+    async with httpx.AsyncClient(timeout=90) as client:
+        if len(items) == 1 and items[0]["kind"] == "video":
+            c = await ig_graph_post(client, f"{IG_ACCOUNT_ID}/media", {
+                "media_type": "REELS", "video_url": urls[0], "caption": caption,
+            })
+            await ig_wait_ready(client, c["id"], 300)
+        elif len(items) == 1:
+            c = await ig_graph_post(client, f"{IG_ACCOUNT_ID}/media", {
+                "image_url": urls[0], "caption": caption,
+            })
+            await ig_wait_ready(client, c["id"], 60)
+        else:
+            child_ids = []
+            for u in urls:
+                ch = await ig_graph_post(client, f"{IG_ACCOUNT_ID}/media", {
+                    "image_url": u, "is_carousel_item": "true",
+                })
+                await ig_wait_ready(client, ch["id"], 60)
+                child_ids.append(ch["id"])
+            c = await ig_graph_post(client, f"{IG_ACCOUNT_ID}/media", {
+                "media_type": "CAROUSEL", "children": ",".join(child_ids), "caption": caption,
+            })
+            await ig_wait_ready(client, c["id"], 60)
+        pub = await ig_graph_post(client, f"{IG_ACCOUNT_ID}/media_publish", {"creation_id": c["id"]})
+        media_id = pub["id"]
+        link = ""
+        try:
+            r = await client.get(
+                f"{IG_GRAPH}/{media_id}",
+                params={"fields": "permalink", "access_token": IG_TOKEN},
+            )
+            link = r.json().get("permalink", "")
+        except Exception:
+            pass
+        return link or "(ссылка недоступна, пост опубликован)"
+
+
+async def ig_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    user = update.effective_user
+    if not q or not is_admin(user.id if user else None):
+        return
+    await q.answer()
+    st = ig_state(context)
+    if q.data == "ig_cancel":
+        ig_reset(context)
+        await q.message.reply_text("Публикация отменена.")
+        raise ApplicationHandlerStop
+    if q.data == "ig_publish":
+        if not st["items"]:
+            await q.message.reply_text("Сначала пришлите фото или видео.")
+            raise ApplicationHandlerStop
+        if st.get("busy"):
+            raise ApplicationHandlerStop
+        st["busy"] = True
+        await q.message.reply_text("Публикую в Instagram, подождите (видео может занять до нескольких минут)...")
+        try:
+            link = await ig_publish_items(st["items"], st["caption"])
+            await q.message.reply_text(f"✅ Опубликовано: {link}")
+            ig_reset(context)
+        except Exception as e:
+            log.warning("Instagram publish xatolik: %s", e)
+            st["busy"] = False
+            await q.message.reply_text(f"❌ Не получилось опубликовать: {str(e)[:500]}\nМожно нажать «Опубликовать» ещё раз.", reply_markup=IG_KEYBOARD)
+        raise ApplicationHandlerStop
+
+
 # ---------------------------------------------------------------------------
 # 24/7 Bulutli Serverlar uchun Yengil Health-check Web Serveri
 # ---------------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/media/"):
+            name = os.path.basename(self.path.split("?", 1)[0])
+            fpath = IG_MEDIA_DIR / name
+            if re.fullmatch(r"[0-9a-f]{32}\.(jpg|mp4)", name) and fpath.is_file():
+                data = fpath.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4" if name.endswith(".mp4") else "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
@@ -2002,6 +2288,20 @@ def main() -> None:
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("reload", cmd_reload))
+
+    # Instagram'ga post chiqarish (faqat admin) - oddiy handlerlardan oldin
+    app.add_handler(CommandHandler("post", cmd_post))
+    app.add_handler(CommandHandler("cancel_post", cmd_cancel_post))
+    app.add_handler(CommandHandler("ig_check", cmd_ig_check))
+    app.add_handler(CallbackQueryHandler(ig_handle_callback, pattern=r"^ig_"), group=-1)
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & (filters.PHOTO | filters.VIDEO), ig_handle_media),
+        group=-1,
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, ig_handle_caption),
+        group=-1,
+    )
 
     # Tugmalar (Callback query)
     app.add_handler(CallbackQueryHandler(handle_callback_query))
