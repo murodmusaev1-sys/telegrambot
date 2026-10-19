@@ -2367,6 +2367,7 @@ def ig_handle_webhook_payload(payload: dict) -> None:
                     text = "[клиент прислал фото или файл]"
                 else:
                     continue
+            log.info("IG DM xabari navbatga qo'yildi")
             asyncio.run_coroutine_threadsafe(ig_process_dm(sender, text), MAIN_LOOP)
 
 
@@ -2421,11 +2422,13 @@ class HealthHandler(BaseHTTPRequestHandler):
             length = 0
         body = self.rfile.read(min(length, 1_000_000))
         if not ig_verify_signature(body, self.headers.get("X-Hub-Signature-256", "")):
+            log.warning("IG webhook keldi, lekin imzo mos kelmadi (INSTAGRAM_APP_SECRET ni tekshiring)")
             self.send_response(403)
             self.end_headers()
             return
         self.send_response(200)
         self.end_headers()
+        log.info("IG webhook qabul qilindi (%s bayt)", len(body))
         try:
             ig_handle_webhook_payload(json.loads(body.decode("utf-8")))
         except Exception as e:
