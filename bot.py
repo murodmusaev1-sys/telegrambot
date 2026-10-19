@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -14,7 +15,8 @@ import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1922,6 +1924,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 # ---------------------------------------------------------------------------
 async def post_init(application: Application) -> None:
     """Telegram menyusida buyruqlarni ro'yxatdan o'tkazish."""
+    global MAIN_LOOP, TG_APP
+    MAIN_LOOP = asyncio.get_running_loop()
+    TG_APP = application
     ensure_photo_folders()
     commands = [
         BotCommand("start", "Botni ishga tushirish / Запустить бота"),
@@ -2208,11 +2213,184 @@ async def ig_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         raise ApplicationHandlerStop
 
 
+
+# ---------------------------------------------------------------------------
+# Instagram Direct: kiruvchi xabarlarga Claude orqali javob (webhook)
+# ---------------------------------------------------------------------------
+IG_APP_SECRET = os.getenv("INSTAGRAM_APP_SECRET", "").strip()
+IG_VERIFY_TOKEN = os.getenv("IG_VERIFY_TOKEN", "").strip()
+IG_HISTORY: dict[str, list] = defaultdict(list)
+IG_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+IG_SEEN_MIDS: list = []
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+TG_APP: Optional[Application] = None
+
+IG_DM_EXTRA = (
+    "\n\n[ВАЖНО: сейчас ты отвечаешь клиенту в личных сообщениях Instagram (директ). "
+    "Ты не можешь отправлять фото и кнопки. Если клиент просит фото или каталог, предложи посмотреть "
+    "примеры в профиле @dekor_panell или в Телеграме: t.me/Dekor_Panel, и не вызывай show_photos. "
+    "Пиши простым текстом, без HTML и без markdown-разметки (без **, #, таблиц). Ответ короткий, до 800 символов.]"
+)
+IG_DM_TOOLS = [t for t in TOOLS if t.get("name") == "notify_manager"]
+
+
+def ig_verify_signature(body: bytes, header: str) -> bool:
+    if not IG_APP_SECRET or not header or not header.startswith("sha256="):
+        return False
+    expected = hmac.new(IG_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header.split("=", 1)[1])
+
+
+def ig_clean_text(text: str) -> str:
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"(?m)^#+\s*", "", text)
+    return text.strip()
+
+
+async def ig_send_dm(recipient_id: str, text: str) -> None:
+    chunks = []
+    text = ig_clean_text(text)
+    while text:
+        chunks.append(text[:900])
+        text = text[900:]
+    async with httpx.AsyncClient(timeout=30) as client_http:
+        for chunk in chunks:
+            r = await client_http.post(
+                f"{IG_GRAPH}/{IG_ACCOUNT_ID}/messages",
+                headers={"Authorization": f"Bearer {IG_TOKEN}"},
+                json={"recipient": {"id": recipient_id}, "message": {"text": chunk}},
+            )
+            if r.status_code >= 400:
+                log.warning("IG DM yuborishda xatolik: %s", r.text[:300])
+                break
+
+
+async def ig_lookup_username(sender_id: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=20) as client_http:
+            r = await client_http.get(
+                f"{IG_GRAPH}/{sender_id}",
+                params={"fields": "username,name", "access_token": IG_TOKEN},
+            )
+        js = r.json()
+        return js.get("username") or js.get("name") or ""
+    except Exception:
+        return ""
+
+
+async def ig_notify_manager(sender_id: str, inp: dict) -> str:
+    username = await ig_lookup_username(sender_id)
+    who = f"@{username}" if username else f"ID {sender_id}"
+    text = (
+        "🔔 НОВАЯ ЗАЯВКА из Instagram (директ)\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        f"👤 Клиент: {who}\n"
+        f"📱 Телефон: {inp.get('client_phone') or 'не указан'}\n"
+        f"📦 Товар: {inp.get('product') or 'не указан'}\n"
+        f"🔢 Объём: {inp.get('quantity') or 'не указан'}\n"
+        f"🕒 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"📝 Детали:\n{inp.get('summary', '')}\n\n"
+        "Ответьте клиенту в директе Instagram dekor_panell."
+    )
+    if MANAGER_CHAT_ID and TG_APP:
+        try:
+            await TG_APP.bot.send_message(chat_id=MANAGER_CHAT_ID, text=text)
+        except Exception as e:
+            log.error("Menejerga IG zayavka yetib bormadi: %s", e)
+    return "Заявка передана менеджеру. Сообщи клиенту, что менеджер скоро свяжется с ним."
+
+
+async def ig_ask_claude(sender_id: str, text: str) -> str:
+    if not client:
+        return f"Сейчас консультант недоступен. Свяжитесь с менеджером: {MANAGER_PHONE_PRIMARY}, Telegram @{MANAGER_USERNAME}"
+    history = IG_HISTORY[sender_id]
+    history.append({"role": "user", "content": text})
+    answer = ""
+    for _ in range(4):
+        resp = await client.messages.create(
+            model=MODEL,
+            max_tokens=700,
+            system=[{"type": "text", "text": SYSTEM_PROMPT + IG_DM_EXTRA}],
+            tools=IG_DM_TOOLS,
+            messages=history,
+        )
+        history.append({"role": "assistant", "content": resp.content})
+        if resp.stop_reason != "tool_use":
+            answer = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            break
+        results = []
+        for block in resp.content:
+            if getattr(block, "type", "") == "tool_use":
+                out = await ig_notify_manager(sender_id, block.input) if block.name == "notify_manager" else "Недоступно."
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": out})
+        history.append({"role": "user", "content": results})
+    trim_history(history)
+    return answer
+
+
+async def ig_process_dm(sender_id: str, text: str) -> None:
+    async with IG_LOCKS[sender_id]:
+        try:
+            answer = await ig_ask_claude(sender_id, text)
+            if answer:
+                await ig_send_dm(sender_id, answer)
+        except Exception as e:
+            log.exception("IG DM qayta ishlashda xatolik: %s", e)
+            try:
+                await ig_send_dm(
+                    sender_id,
+                    f"Извините, произошла техническая ошибка. Свяжитесь с менеджером: {MANAGER_PHONE_PRIMARY}, Telegram @{MANAGER_USERNAME}",
+                )
+            except Exception:
+                pass
+
+
+def ig_handle_webhook_payload(payload: dict) -> None:
+    """Webhook oqimidan chaqiriladi; xabarlarni asosiy event loop'ga uzatadi."""
+    if not MAIN_LOOP:
+        return
+    for entry in payload.get("entry", []):
+        for ev in entry.get("messaging", []):
+            msg = ev.get("message") or {}
+            sender = str((ev.get("sender") or {}).get("id", ""))
+            if not sender or msg.get("is_echo") or sender in (str(entry.get("id")), IG_ACCOUNT_ID):
+                continue
+            mid = msg.get("mid")
+            if mid:
+                if mid in IG_SEEN_MIDS:
+                    continue
+                IG_SEEN_MIDS.append(mid)
+                del IG_SEEN_MIDS[:-500]
+            text = (msg.get("text") or "").strip()
+            if not text:
+                if msg.get("attachments"):
+                    text = "[клиент прислал фото или файл]"
+                else:
+                    continue
+            asyncio.run_coroutine_threadsafe(ig_process_dm(sender, text), MAIN_LOOP)
+
+
 # ---------------------------------------------------------------------------
 # 24/7 Bulutli Serverlar uchun Yengil Health-check Web Serveri
 # ---------------------------------------------------------------------------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/webhook/instagram"):
+            q = parse_qs(urlparse(self.path).query)
+            mode = (q.get("hub.mode") or [""])[0]
+            token = (q.get("hub.verify_token") or [""])[0]
+            challenge = (q.get("hub.challenge") or [""])[0]
+            if mode == "subscribe" and IG_VERIFY_TOKEN and token == IG_VERIFY_TOKEN:
+                body = challenge.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(403)
+                self.end_headers()
+            return
         if self.path.startswith("/media/"):
             name = os.path.basename(self.path.split("?", 1)[0])
             fpath = IG_MEDIA_DIR / name
@@ -2232,6 +2410,27 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Dekor Panel Telegram Bot 24/7 ishlamoqda! Status: OK")
 
+    def do_POST(self):
+        if not self.path.startswith("/webhook/instagram"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        body = self.rfile.read(min(length, 1_000_000))
+        if not ig_verify_signature(body, self.headers.get("X-Hub-Signature-256", "")):
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.end_headers()
+        try:
+            ig_handle_webhook_payload(json.loads(body.decode("utf-8")))
+        except Exception as e:
+            log.warning("IG webhook qayta ishlashda xatolik: %s", e)
+
     def log_message(self, format, *args):
         pass  # Terminal loglarini ortiqcha to'ldirmaslik
 
@@ -2241,7 +2440,7 @@ def start_health_server() -> None:
 
     def _run():
         try:
-            server = HTTPServer(("0.0.0.0", port), HealthHandler)
+            server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
             log.info("Foniy 24/7 Web server %s-portda ishga tushdi", port)
             server.serve_forever()
         except Exception as e:
@@ -2251,13 +2450,7 @@ def start_health_server() -> None:
     t.start()
 
 
-def main() -> None:
-    if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN muhit o'zgaruvchisi topilmadi (.env faylini tekshiring)!")
-
-    # 24/7 bepul serverlar uchun foniy serverni yurgizish
-    start_health_server()
-
+def run_bot_once() -> None:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -2324,6 +2517,30 @@ def main() -> None:
 
     log.info("Dekor Panel Telegram boti muvaffaqiyatli ishga tushmoqda...")
     app.run_polling(drop_pending_updates=True, bootstrap_retries=-1)
+
+
+def main() -> None:
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN muhit o'zgaruvchisi topilmadi (.env faylini tekshiring)!")
+
+    # 24/7 bepul serverlar uchun foniy serverni yurgizish (bir marta, bot qayta ishga tushsa ham ishlayveradi)
+    start_health_server()
+
+    # Tarmoq xatosi (masalan, Telegram "Bad Gateway") botni o'chirib qo'ymasligi uchun qayta urinish
+    delay = 5
+    while True:
+        try:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+            LOCKS.clear()
+            IG_LOCKS.clear()
+            run_bot_once()
+            break  # to'xtatish signali (Ctrl+C) - normal chiqish
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log.error("Bot to'xtab qoldi (%s). %s soniyadan keyin qayta urinadi...", e, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
 
 
 if __name__ == "__main__":
