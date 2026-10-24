@@ -365,15 +365,46 @@ def get_category_photos(cat_key: str, query: str = "") -> list[Path]:
 # ---------------------------------------------------------------------------
 # Telegram UI: Tugmalar va menyular
 # ---------------------------------------------------------------------------
+BTN_CATALOG = "📁 Katalog / Каталог"
+BTN_MANAGER = "👨‍💼 Menejer / Менеджер"
+BTN_LOCATION = "📍 Manzil / Локация"
+BTN_CONTACT = "📱 Raqam qoldirish"
+BTN_RESET = "🔄 Yangilash / Сброс"
+BTN_INFO = "ℹ️ Ma'lumot / Инфо"
+BTN_ADMIN = "⚙️ Admin Panel"
+BTN_BACK = "🔙 Asosiy menyu"
+
+
+def norm_menu_text(text: str) -> str:
+    return " ".join(text.lower().replace("️", "").split())
+
+
+# Xabar to'liq shu matnlardan biriga teng bo'lsagina menyu amali bajariladi
+MENU_ACTIONS: dict[str, str] = {
+    norm_menu_text(label): action
+    for action, labels in {
+        "catalog": (BTN_CATALOG, "katalog", "каталог", "catalog"),
+        "manager": (BTN_MANAGER, "menejer", "менеджер", "manager"),
+        "location": (BTN_LOCATION, "manzil", "локация", "адрес", "xarita", "location"),
+        "contact": (BTN_CONTACT, "raqam qoldirish", "оставить номер"),
+        "reset": (BTN_RESET, "yangilash", "сброс", "reset", "qayta boshlash"),
+        "info": (BTN_INFO, "ma'lumot", "malumot", "инфо", "info"),
+        "admin": (BTN_ADMIN, "admin", "админ", "admin panel"),
+        "back": (BTN_BACK, "orqaga", "asosiy menyu", "назад", "меню"),
+    }.items()
+    for label in labels
+}
+
+
 def get_main_reply_keyboard(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
     """Pastki doimiy menyu tugmalari."""
     buttons = [
-        [KeyboardButton("📁 Katalog / Каталог"), KeyboardButton("👨‍💼 Menejer / Менеджер")],
-        [KeyboardButton("📍 Manzil / Локация"), KeyboardButton("📱 Raqam qoldirish")],
-        [KeyboardButton("🔄 Yangilash / Сброс"), KeyboardButton("ℹ️ Ma'lumot / Инфо")],
+        [KeyboardButton(BTN_CATALOG), KeyboardButton(BTN_MANAGER)],
+        [KeyboardButton(BTN_LOCATION), KeyboardButton(BTN_CONTACT)],
+        [KeyboardButton(BTN_RESET), KeyboardButton(BTN_INFO)],
     ]
     if is_admin_user:
-        buttons.append([KeyboardButton("⚙️ Admin Panel")])
+        buttons.append([KeyboardButton(BTN_ADMIN)])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
 
@@ -531,6 +562,14 @@ def get_admin_del_photo_category_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
+def split_cat_page(rest: str) -> tuple[str, int]:
+    """'pvh_paneli_2' -> ('pvh_paneli', 2). Toifa kalitida '_' bo'lishi mumkin, sahifa doim oxirida."""
+    cat_key, sep, page = rest.rpartition("_")
+    if sep and page.isdigit():
+        return cat_key, int(page)
+    return rest, 0
+
+
 def get_admin_category_photos_del_keyboard(
     cat_key: str, page: int = 0
 ) -> tuple[str, InlineKeyboardMarkup]:
@@ -657,12 +696,22 @@ EXTRA_RULES = """
 - Если клиент прислал фото своей комнаты/стены или желаемого товара, определи дизайн и предложи подходящий вариант из нашего каталога.
 """
 
+# Master-promptga qo'shiladigan mavzuli bloklar (fayl bo'lmasa o'tkazib yuboriladi)
+PROMPT_BLOCK_FILES = ["alyukobond_blok_prompt.md"]
+
+
 def load_system_prompt() -> str:
     prompt_file = BASE_DIR / "master_prompt.md"
     if prompt_file.exists():
         base = prompt_file.read_text(encoding="utf-8")
     else:
         base = "Ты — консультант завода Dekor Panel в Ташкенте."
+    for name in PROMPT_BLOCK_FILES:
+        block_file = BASE_DIR / name
+        if block_file.exists():
+            base += "\n\n" + block_file.read_text(encoding="utf-8").strip() + "\n"
+        else:
+            log.warning("Prompt bloki topilmadi: %s", name)
     return base + EXTRA_RULES
 
 
@@ -1110,31 +1159,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    clean_text = text.lower().replace("\ufe0f", "").strip()
-
-    # Reply menyudagi tugmalar bosilganda tezkor javoblar
-    if any(k in clean_text for k in ("katalog", "каталог", "catalog")):
+    # Reply menyudagi tugmalar bosilganda tezkor javoblar.
+    # Faqat butun xabar tugma matniga (yoki bitta so'zga) teng bo'lsa ishlaydi,
+    # aks holda "номер дизайна" kabi oddiy savollar Claude'ga yetib bormaydi.
+    menu_action = MENU_ACTIONS.get(norm_menu_text(text))
+    if menu_action == "catalog":
         await cmd_catalog(update, context)
         return
-    elif any(k in clean_text for k in ("menejer", "менеджер", "manager")):
+    elif menu_action == "manager":
         await cmd_manager(update, context)
         return
-    elif any(k in clean_text for k in ("manzil", "локация", "адрес", "xarita", "location")):
+    elif menu_action == "location":
         await cmd_location(update, context)
         return
-    elif any(k in clean_text for k in ("raqam", "telefon", "номер", "kontakt", "contact", "bog'lanish")):
+    elif menu_action == "contact":
         await prompt_contact_request(update, context)
         return
-    elif any(k in clean_text for k in ("yangilash", "сброс", "reset", "qayta boshlash")):
+    elif menu_action == "reset":
         await cmd_reset(update, context)
         return
-    elif any(k in clean_text for k in ("ma'lumot", "malumot", "инфо", "info", "haqida")):
+    elif menu_action == "info":
         await cmd_info(update, context)
         return
-    elif is_admin(user_id) and any(k in clean_text for k in ("admin", "админ")):
+    elif menu_action == "admin" and is_admin(user_id):
         await cmd_admin(update, context)
         return
-    elif any(k in clean_text for k in ("orqaga", "asosiy menyu", "назад", "меню")):
+    elif menu_action == "back":
         await update.effective_message.reply_text(
             "🏢 <b>Asosiy menyu:</b>",
             parse_mode=ParseMode.HTML,
@@ -1315,7 +1365,7 @@ async def prompt_contact_request(update: Update, context: ContextTypes.DEFAULT_T
     contact_keyboard = ReplyKeyboardMarkup(
         [
             [KeyboardButton("📲 Telefon raqamimni ulashish", request_contact=True)],
-            [KeyboardButton("🔙 Asosiy menyu")],
+            [KeyboardButton(BTN_BACK)],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -1622,19 +1672,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         elif data.startswith("adm_delcat_"):
-            parts = data.split("_")
-            cat_key = parts[2]
-            page = int(parts[3]) if len(parts) > 3 else 0
+            cat_key, page = split_cat_page(data[len("adm_delcat_"):])
             text, kb = get_admin_category_photos_del_keyboard(cat_key, page)
             await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
             return
 
         elif data.startswith("adm_askdel_"):
-            parts = data.split("_")
-            short_id = parts[2]
-            cat_key = parts[3]
-            page = int(parts[4]) if len(parts) > 4 else 0
-            p = DEL_PHOTO_CACHE.get(short_id)
+            short_id, _, rest = data[len("adm_askdel_"):].partition("_")
+            cat_key, page = split_cat_page(rest)
+            p =DEL_PHOTO_CACHE.get(short_id)
             if not p or not p.is_file():
                 await query.answer("Fayl topilmadi yoki allaqachon o'chirilgan!", show_alert=True)
                 return
@@ -1676,11 +1722,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         elif data.startswith("adm_dodel_"):
-            parts = data.split("_")
-            short_id = parts[2]
-            cat_key = parts[3]
-            page = int(parts[4]) if len(parts) > 4 else 0
-            p = DEL_PHOTO_CACHE.get(short_id)
+            short_id, _, rest = data[len("adm_dodel_"):].partition("_")
+            cat_key, page = split_cat_page(rest)
+            p =DEL_PHOTO_CACHE.get(short_id)
             if p and p.is_file():
                 fname = p.name
                 p.unlink(missing_ok=True)
@@ -2235,10 +2279,16 @@ IG_DM_TOOLS = [t for t in TOOLS if t.get("name") == "notify_manager"]
 
 
 def ig_verify_signature(body: bytes, header: str) -> bool:
-    if not IG_APP_SECRET or not header or not header.startswith("sha256="):
+    # INSTAGRAM_APP_SECRET ichida bir nechta secret vergul bilan berilishi mumkin
+    secrets = [x.strip() for x in IG_APP_SECRET.split(",") if x.strip()]
+    if not secrets or not header or not header.startswith("sha256="):
         return False
-    expected = hmac.new(IG_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header.split("=", 1)[1])
+    got = header.split("=", 1)[1]
+    for sec in secrets:
+        expected = hmac.new(sec.encode(), body, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, got):
+            return True
+    return False
 
 
 def ig_clean_text(text: str) -> str:
